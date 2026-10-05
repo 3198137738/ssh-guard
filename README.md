@@ -96,7 +96,7 @@ sudo ./ssh-guard.sh help
 | `--no-docker` | | 不在 DOCKER-USER 链封禁 |
 | `--disable-password` | | 安装后顺便执行 harden |
 
-`report` 选项：`--since "24 hours ago"`（只对 journal 有效）、`--top N`、`--log FILE`。
+`report` 选项：`--since "24 hours ago"`（只对 journal 有效）、`--top N`（默认显示全部 IP）、`--log FILE`。
 
 `addkey` 选项（公钥来源至少一种，可组合）：
 

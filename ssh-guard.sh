@@ -12,7 +12,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- install
 set -uo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 RAW_URL="https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh"
 JAIL_FILE=/etc/fail2ban/jail.d/ssh-guard.local
 F2B_CONF_FILE=/etc/fail2ban/fail2ban.d/ssh-guard.local
@@ -38,7 +38,7 @@ DOCKER=auto
 DISABLE_PW=0
 FORCE=0
 SINCE=""
-TOP=30
+TOP=0
 LOGFILE=""
 BAN_MIN=1
 SUBNET_MIN=3
@@ -97,7 +97,7 @@ harden 选项:
 
 report 选项:
   --since T            只分析该时间之后的日志（仅 journal 有效），如 "2026-10-01" / "24 hours ago"
-  --top N              显示前 N 个 IP（默认 30）
+  --top N              只显示前 N 个 IP（默认 0 = 全部）
   --log FILE           指定日志文件（支持 .gz）
 
 banlog 选项（也支持 --since / --log 限定分析范围）:
@@ -488,9 +488,9 @@ do_report() {
   printf '失败/异常连接: %s 次，来源 IP: %s 个，当前已封禁: %s 个 IP、%s 个网段\n\n' \
     "$total" "$uniq_n" "$(wc -l <"$tmp/banned")" "$(grep -c . "$tmp/nets")"
 
-  echo "---- 失败次数前 $TOP 的 IP ----"
+  if [ "$TOP" -gt 0 ] 2>/dev/null; then echo "---- 失败次数前 $TOP 的 IP ----"; else echo "---- 全部 $uniq_n 个 IP（按失败次数排序）----"; fi
   printf '%6s  %-39s %-41s %s\n' 次数 IP "首次 ~ 末次" 状态
-  head -n "$TOP" "$tmp/stats" | awk -F'\t' -v B="$tmp/banned" -v NETS="$tmp/nets" '
+  { if [ "$TOP" -gt 0 ] 2>/dev/null; then head -n "$TOP" "$tmp/stats"; else cat "$tmp/stats"; fi; } | awk -F'\t' -v B="$tmp/banned" -v NETS="$tmp/nets" '
     BEGIN { while ((getline l < B) > 0) b[l] = 1; while ((getline l < NETS) > 0) { sub(/\.0\/24$/, "", l); n[l] = 1 } }
     {
       s = ""
@@ -1180,7 +1180,7 @@ menu_deploy() {
        remote=(addkey --key "$(cat "$LOCAL_PUBKEY")")
        confirm "这些服务器目前只能用密码登录（逐台连接并输入密码）" y && use_pw=1 ;;
     1) ask_install_opts; remote=("${INSTALL_ARGS[@]}") ;;
-    2) ask_int TOP "每台显示前几个 IP" 10; remote=(report --top "$TOP") ;;
+    2) ask_int TOP "每台显示前几个 IP（0 = 全部）" 0; remote=(report --top "$TOP") ;;
     3) remote=(status) ;;
     4) confirm "确认所有服务器都已配置公钥并测试过密钥登录" n || return 0; remote=(harden) ;;
     5) ask_banlog_opts; remote=("${BANLOG_ARGS[@]}") ;;
@@ -1239,7 +1239,7 @@ EOF
     # 每个功能在子 shell 中执行，出错 die 时只退出该功能，回到菜单
     case "$choice" in
       1) ask_install_opts; ( do_install ) ;;
-      2) ask_int TOP "显示前几个 IP" "$TOP"
+      2) ask_int TOP "显示前几个 IP（0 = 全部）" "$TOP"
          ask SINCE "只看某时间之后的日志（如 24 hours ago，留空为全部）" ""
          ( do_report ) ;;
       3) ask_banlog_opts
@@ -1286,7 +1286,7 @@ while [ $# -gt 0 ]; do
     --disable-password) DISABLE_PW=1; shift ;;
     --force) FORCE=1; shift ;;
     --since) SINCE=${2:?}; shift 2 ;;
-    --top) TOP=${2:?}; shift 2 ;;
+    --top) TOP=${2:?}; [ "$TOP" = all ] && TOP=0; shift 2 ;;
     --log) LOGFILE=${2:?}; shift 2 ;;
     --min) BAN_MIN=${2:?}; shift 2 ;;
     --subnet-min) SUBNET_MIN=${2:?}; shift 2 ;;

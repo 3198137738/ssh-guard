@@ -7,6 +7,7 @@ SSH 爆破防护一键脚本，基于 fail2ban：
 - **Docker 兼容**：检测到 Docker 时额外在 `DOCKER-USER` 链封禁（容器映射端口不走 INPUT 链）
 - **自动白名单**：当前登录会话的来源 IP 自动加入 ignoreip，避免把自己封掉
 - **爆破分析报告**：失败次数 Top IP、首次/末次出现时间、是否已封、/24 网段汇总
+- **一键封禁日志中的爆破 IP 和 IP 段**：IP 交给 fail2ban 封；同一 /24 有多个 IP 参与爆破时封整段（独立的 hash:net 集合，重启自动恢复）；白名单和成功登录过的 IP 不会误封
 - **关闭密码登录**（可选）：先检查是否配置了公钥，`sshd -t` 校验失败自动回滚
 - 兼容 Debian / Ubuntu / CentOS / Rocky / Alma / openSUSE / Alpine；iptables / nftables / firewalld；auth.log / secure / journal；OpenSSH 9.8+ 的 `sshd-session`
 
@@ -22,12 +23,13 @@ curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard
 =================== ssh-guard ===================
   1) 安装/更新防护（fail2ban aggressive 模式 + 自动封禁）
   2) 爆破分析报告（Top IP、首/末次时间、/24 网段）
-  3) 查看封禁状态
-  4) 解封 IP
-  5) 关闭 SSH 密码登录（仅允许密钥）
-  6) 恢复 SSH 密码登录
-  7) 批量部署到多台服务器
-  8) 卸载 ssh-guard 的 fail2ban 配置
+  3) 一键封禁日志中的爆破 IP 和 IP 段
+  4) 查看封禁状态
+  5) 解封 IP 或 IP 段
+  6) 关闭 SSH 密码登录（仅允许密钥）
+  7) 恢复 SSH 密码登录
+  8) 批量部署到多台服务器
+  9) 卸载 ssh-guard 的 fail2ban 配置和网段封禁
   0) 退出
 ```
 
@@ -43,6 +45,10 @@ curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard
 
 # 查看爆破分析报告
 curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- report
+
+# 一键封禁日志中所有爆破 IP 和爆破集中的 /24 网段（建议先加 --dry-run 预览）
+curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- banlog --dry-run
+curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- banlog
 
 # 安装防护，同时关闭密码登录（请先确认密钥能登录）
 curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- install --disable-password
@@ -65,8 +71,10 @@ sudo ./ssh-guard.sh help
 | `harden` | 关闭密码登录，只允许密钥 |
 | `unharden` | 撤销 harden |
 | `status` | 查看封禁情况 |
-| `unban <IP>...` | 解封 IP |
-| `uninstall` | 移除 ssh-guard 写入的 fail2ban 配置 |
+| `banlog` | 一键封禁日志中的爆破 IP 和 IP 段 |
+| `unban <IP 或网段>...` | 解封 IP 或网段（如 `1.2.3.0/24`） |
+| `apply-nets` | 手动编辑 `/etc/ssh-guard/blocked-nets.txt` 后重建网段规则 |
+| `uninstall` | 移除 ssh-guard 写入的 fail2ban 配置和网段封禁 |
 | `deploy` | 批量在多台服务器上执行上面的命令 |
 
 `install` 选项：
@@ -83,6 +91,18 @@ sudo ./ssh-guard.sh help
 `report` 选项：`--since "24 hours ago"`（只对 journal 有效）、`--top N`、`--log FILE`。
 
 `harden` 选项：`--force`（没检测到公钥也强制关闭，慎用）。
+
+`banlog` 选项：
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `--min N` | 1 | 失败 ≥ N 次的 IP 才封，默认即日志中所有爆破 IP |
+| `--subnet-min N` | 3 | 同一 /24 中 ≥ N 个 IP 参与爆破时封整个网段 |
+| `--no-subnet` | | 只封单个 IP |
+| `--dry-run` | | 只预览不修改 |
+| `--since T` / `--log FILE` | | 限定分析的日志范围 |
+
+不会被封的：ignoreip 白名单、当前登录会话 IP、日志中成功登录过的 IP；这些 IP 所在的 /24 以及内网/保留网段（10/8、172.16/12、192.168/16、100.64/10 等）也不会整段封。已被网段覆盖的 IP 不再单独封。单个 IP 通过 fail2ban 封禁（封禁时长与 sshd jail 相同），网段为永久封禁。
 
 ## 多台服务器批量执行
 
@@ -125,9 +145,11 @@ curl -fsSL $S | bash -s -- deploy -f hosts.txt -P 20 -i ~/.ssh/id_ed25519 -- sta
 | `/etc/fail2ban/filter.d/ssh-guard-sshd.conf` | 仅 OpenSSH 9.8+ 且 fail2ban < 1.1 时，兼容 `sshd-session` |
 | `/etc/systemd/system/fail2ban.service.d/ssh-guard.conf` | 有 Docker 时让 fail2ban 在 Docker 之后启动 |
 | `/etc/ssh/sshd_config.d/00-ssh-guard.conf` | harden 写入；不支持 Include 时改为插入到 `sshd_config` 开头 |
+| `/etc/ssh-guard/blocked-nets.txt` | banlog 封禁的网段列表 |
+| `/usr/local/sbin/ssh-guard-nets-restore`、`ssh-guard-nets.service` | 开机重建网段封禁（firewalld 自身会持久化，不需要） |
 
 ## 注意
 
 - 关闭密码登录后**不要断开当前会话**，另开窗口用密钥登录成功再退出
-- 误封自己：从控制台登录后执行 `ssh-guard.sh unban <IP>`，并用 `install --ignoreip <IP>` 加入白名单
+- 误封自己：从控制台登录后执行 `ssh-guard.sh unban <IP>`（网段用 `unban 1.2.3.0/24`），并用 `install --ignoreip <IP>` 加入白名单
 - 国内服务器访问 `raw.githubusercontent.com` 不稳定时，在能访问 GitHub 的机器上用 `deploy` 推送

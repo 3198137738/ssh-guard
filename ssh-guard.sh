@@ -12,7 +12,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- install
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 RAW_URL="https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh"
 JAIL_FILE=/etc/fail2ban/jail.d/ssh-guard.local
 F2B_CONF_FILE=/etc/fail2ban/fail2ban.d/ssh-guard.local
@@ -22,6 +22,10 @@ SYSTEMD_DROPIN=/etc/systemd/system/fail2ban.service.d/ssh-guard.conf
 SSHD_CONFIG=/etc/ssh/sshd_config
 SSHD_DROPIN=/etc/ssh/sshd_config.d/00-ssh-guard.conf
 MARK="# managed by ssh-guard"
+NETS_FILE=/etc/ssh-guard/blocked-nets.txt
+NET_SET=ssh-guard-net
+NETS_UNIT=/etc/systemd/system/ssh-guard-nets.service
+NETS_RESTORE=/usr/local/sbin/ssh-guard-nets-restore
 
 # 默认参数
 MAXRETRY=3
@@ -34,6 +38,10 @@ FORCE=0
 SINCE=""
 TOP=30
 LOGFILE=""
+BAN_MIN=1
+SUBNET_MIN=3
+NO_SUBNET=0
+DRY_RUN=0
 
 if [ -t 1 ]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' B=$'\e[36m' N=$'\e[0m'; else R='' G='' Y='' B='' N=''; fi
 info() { printf '%s[*]%s %s\n' "$B" "$N" "$*"; }
@@ -53,8 +61,10 @@ usage() {
   harden               关闭 SSH 密码登录，只允许密钥（会先检查是否已配置公钥）
   unharden             撤销 harden，恢复原来的密码登录设置
   status               查看当前封禁情况
-  unban <IP>...        解封 IP
-  uninstall            移除 ssh-guard 写入的 fail2ban 配置（不卸载 fail2ban）
+  banlog               一键封禁日志中所有爆破 IP 及爆破集中的 /24 网段（需先 install）
+  unban <IP|网段>...   解封 IP 或网段（如 1.2.3.0/24）
+  apply-nets           按 /etc/ssh-guard/blocked-nets.txt 重建网段封禁规则（手动编辑列表后执行）
+  uninstall            移除 ssh-guard 写入的 fail2ban 配置和网段封禁（不卸载 fail2ban）
   deploy               在多台服务器上并发执行本脚本的某个命令（本机无需 root）
   help                 显示本帮助
 
@@ -74,6 +84,13 @@ report 选项:
   --top N              显示前 N 个 IP（默认 30）
   --log FILE           指定日志文件（支持 .gz）
 
+banlog 选项（也支持 --since / --log 限定分析范围）:
+  --min N              失败 ≥ N 次的 IP 才封（默认 1，即日志中所有爆破 IP）
+  --subnet-min N       同一 /24 中有 ≥ N 个 IP 参与爆破时封整个网段（默认 3）
+  --no-subnet          只封单个 IP，不封网段
+  --dry-run            只预览要封禁的 IP 和网段，不做修改
+  白名单 IP、日志中成功登录过的 IP 不会被封，它们所在的网段以及内网/保留网段也不会被封
+
 deploy 用法: ssh-guard.sh deploy -f hosts.txt [选项] [-- 远程命令和参数]（远程命令默认 install）
   -f, --hosts FILE     服务器列表，每行 [user@]host[:port]，# 开头为注释
   -P, --parallel N     并发数（默认 10）
@@ -86,6 +103,7 @@ deploy 用法: ssh-guard.sh deploy -f hosts.txt [选项] [-- 远程命令和参�
   curl -fsSL <RAW_URL> | sudo bash
   curl -fsSL <RAW_URL> | sudo bash -s -- install --maxretry 5 --ignoreip "1.2.3.4" --disable-password
   curl -fsSL <RAW_URL> | sudo bash -s -- report --since "24 hours ago"
+  curl -fsSL <RAW_URL> | sudo bash -s -- banlog --dry-run
   curl -fsSL <RAW_URL> | bash -s -- deploy -f hosts.txt -s -- report --top 10
 EOF
 }
@@ -400,48 +418,67 @@ do_install() {
 
 # -------------------------------------------------------------- report ---
 
-do_report() {
-  local tmp total uniq_n
-  tmp=$(mktemp -d)
-  collect_logs >"$tmp/all.log"
-  [ -s "$tmp/all.log" ] || { rm -rf "$tmp"; die "没有读到 SSH 日志"; }
-  grep -E "$FAIL_RE" "$tmp/all.log" >"$tmp/fail.log"
-  if [ ! -s "$tmp/fail.log" ]; then
-    rm -rf "$tmp"; ok "日志中没有失败登录记录"; return 0
-  fi
-
-  # 每行取第一个 IP，统计 次数 / 首次 / 末次
+# 每行取第一个 IP（IPv4 或 IPv6），输出: 时间<TAB>IP
+extract_ips() {
   awk '
     {
       if ($1 ~ /^[0-9][0-9][0-9][0-9]-/) { t = substr($1, 1, 19); s = 3 } else { t = $1 " " $2 " " $3; s = 5 }
-      ip = ""
       for (i = s; i <= NF; i++) {
         f = $i
-        if (f ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || (f ~ /^[0-9a-fA-F:]+$/ && f ~ /:.*:/)) { ip = f; break }
+        if (f ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || (f ~ /^[0-9a-fA-F:]+$/ && f ~ /:.*:/)) { print t "\t" f; break }
       }
-      if (ip == "") next
-      c[ip]++; if (!(ip in first)) first[ip] = t; last[ip] = t
-    }
-    END { for (k in c) printf "%d\t%s\t%s\t%s\n", c[k], k, first[k], last[k] }
-  ' "$tmp/fail.log" | sort -t"$(printf '\t')" -k1,1nr >"$tmp/stats"
+    }' "$@"
+}
 
+# 解析日志，在目录 $1 下生成：
+#   all.log   SSH 日志
+#   stats     次数<TAB>IP<TAB>首次<TAB>末次（按次数降序）
+#   banned    fail2ban 当前封禁的 IP
+#   accepted  曾经成功登录过的 IP
+# 返回 1 表示没有失败记录
+build_stats() {
+  local d=$1
+  collect_logs >"$d/all.log"
+  [ -s "$d/all.log" ] || die "没有读到 SSH 日志"
+  grep -E "$FAIL_RE" "$d/all.log" | extract_ips | awk -F'\t' '
+    { c[$2]++; if (!($2 in first)) first[$2] = $1; last[$2] = $1 }
+    END { for (k in c) printf "%d\t%s\t%s\t%s\n", c[k], k, first[k], last[k] }
+  ' | sort -t"$(printf '\t')" -k1,1nr >"$d/stats"
+  grep -E 'Accepted (password|publickey|keyboard-interactive|gssapi)' "$d/all.log" | extract_ips | cut -f2 | sort -u >"$d/accepted"
+  : >"$d/banned"
   if command -v fail2ban-client >/dev/null 2>&1; then
-    fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p' | tr ' \t' '\n\n' | grep . >"$tmp/banned"
+    fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p' | tr ' \t' '\n\n' | grep . >"$d/banned"
   fi
-  touch "$tmp/banned"
+  [ -s "$d/stats" ]
+}
+
+log_time() { awk '{print ($1 ~ /^[0-9][0-9][0-9][0-9]-/) ? substr($1,1,19) : $1" "$2" "$3}'; }
+
+do_report() {
+  local tmp total uniq_n
+  tmp=$(mktemp -d)
+  if ! build_stats "$tmp"; then
+    rm -rf "$tmp"; ok "日志中没有失败登录记录"; return 0
+  fi
+  [ -f "$NETS_FILE" ] && cp "$NETS_FILE" "$tmp/nets" || : >"$tmp/nets"
 
   total=$(awk -F'\t' '{s+=$1} END{print s+0}' "$tmp/stats")
   uniq_n=$(wc -l <"$tmp/stats")
   echo "======== SSH 爆破分析  $(hostname)  $(date '+%F %T') ========"
-  printf '日志范围: %s ~ %s\n' "$(head -n1 "$tmp/all.log" | awk '{print ($1 ~ /^[0-9][0-9][0-9][0-9]-/) ? substr($1,1,19) : $1" "$2" "$3}')" \
-    "$(tail -n1 "$tmp/all.log" | awk '{print ($1 ~ /^[0-9][0-9][0-9][0-9]-/) ? substr($1,1,19) : $1" "$2" "$3}')"
-  printf '失败/异常连接: %s 次，来源 IP: %s 个，当前已封禁: %s 个\n\n' "$total" "$uniq_n" "$(wc -l <"$tmp/banned")"
+  printf '日志范围: %s ~ %s\n' "$(head -n1 "$tmp/all.log" | log_time)" "$(tail -n1 "$tmp/all.log" | log_time)"
+  printf '失败/异常连接: %s 次，来源 IP: %s 个，当前已封禁: %s 个 IP、%s 个网段\n\n' \
+    "$total" "$uniq_n" "$(wc -l <"$tmp/banned")" "$(grep -c . "$tmp/nets")"
 
   echo "---- 失败次数前 $TOP 的 IP ----"
   printf '%6s  %-39s %-41s %s\n' 次数 IP "首次 ~ 末次" 状态
-  head -n "$TOP" "$tmp/stats" | awk -F'\t' -v B="$tmp/banned" '
-    BEGIN { while ((getline l < B) > 0) b[l] = 1 }
-    { printf "%6d  %-39s %s ~ %s  %s\n", $1, $2, $3, $4, ($2 in b) ? "封禁中" : "" }'
+  head -n "$TOP" "$tmp/stats" | awk -F'\t' -v B="$tmp/banned" -v NETS="$tmp/nets" '
+    BEGIN { while ((getline l < B) > 0) b[l] = 1; while ((getline l < NETS) > 0) { sub(/\.0\/24$/, "", l); n[l] = 1 } }
+    {
+      s = ""
+      if ($2 in b) s = "封禁中"
+      else { k = $2; sub(/\.[0-9]+$/, "", k); if (k in n) s = "网段已封" }
+      printf "%6d  %-39s %s ~ %s  %s\n", $1, $2, $3, $4, s
+    }'
 
   echo
   echo "---- 按 /24 网段汇总（前 10）----"
@@ -452,9 +489,233 @@ do_report() {
   local pw
   pw=$(sshd_opt passwordauthentication)
   echo
+  info "一键封禁以上所有爆破 IP 和网段: ssh-guard.sh banlog（加 --dry-run 先预览）"
   [ "$pw" = yes ] && warn "当前仍允许密码登录，建议配置好密钥后执行: ssh-guard.sh harden"
   command -v fail2ban-client >/dev/null 2>&1 && [ -f "$JAIL_FILE" ] \
     || warn "尚未安装 ssh-guard 防护，执行: ssh-guard.sh install"
+  rm -rf "$tmp"
+}
+
+# -------------------------------------------------------------- banlog ---
+
+# IP 段封禁不走 fail2ban（它的 ipset/nft 集合只能放单个 IP），单独维护一个 hash:net 集合
+net_backend() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then echo firewalld
+  elif command -v iptables >/dev/null 2>&1 && command -v ipset >/dev/null 2>&1; then echo ipset
+  elif command -v nft >/dev/null 2>&1; then echo nft
+  else echo none; fi
+}
+
+# 按 $NETS_FILE 全量重建网段封禁规则（开机时由 ssh-guard-nets.service 调用）
+apply_nets() {
+  need_root
+  local be chain cur
+  be=$(net_backend)
+  mkdir -p "$(dirname "$NETS_FILE")"
+  touch "$NETS_FILE"
+  case "$be" in
+    ipset)
+      ipset -exist create "$NET_SET" hash:net maxelem 1048576
+      { echo "flush $NET_SET"; grep -E '^[0-9.]+/[0-9]+$' "$NETS_FILE" | sed "s|^|add $NET_SET |"; } | ipset -exist restore
+      # Docker 映射端口走 FORWARD，所以 DOCKER-USER 里也要拦
+      for chain in INPUT DOCKER-USER; do
+        iptables -nL "$chain" >/dev/null 2>&1 || continue
+        iptables -C "$chain" -m set --match-set "$NET_SET" src -j DROP 2>/dev/null \
+          || iptables -I "$chain" -m set --match-set "$NET_SET" src -j DROP
+      done
+      ;;
+    firewalld)
+      firewall-cmd --permanent --get-ipsets | tr ' ' '\n' | grep -qx "$NET_SET" \
+        || firewall-cmd --permanent --new-ipset="$NET_SET" --type=hash:net --option=maxelem=1048576 >/dev/null
+      cur=$(mktemp)
+      firewall-cmd --permanent --ipset="$NET_SET" --get-entries >"$cur"
+      [ -s "$cur" ] && firewall-cmd --permanent --ipset="$NET_SET" --remove-entries-from-file="$cur" >/dev/null
+      [ -s "$NETS_FILE" ] && firewall-cmd --permanent --ipset="$NET_SET" --add-entries-from-file="$NETS_FILE" >/dev/null
+      rm -f "$cur"
+      firewall-cmd --permanent --zone=drop --query-source="ipset:$NET_SET" >/dev/null 2>&1 \
+        || firewall-cmd --permanent --zone=drop --add-source="ipset:$NET_SET" >/dev/null
+      firewall-cmd --reload >/dev/null
+      ;;
+    nft)
+      local elems
+      elems=$(grep -E '^[0-9.]+/[0-9]+$' "$NETS_FILE" | paste -sd, -)
+      nft -f - <<EOF
+add table inet ssh_guard
+delete table inet ssh_guard
+table inet ssh_guard {
+  set nets {
+    type ipv4_addr
+    flags interval
+    ${elems:+elements = { $elems }}
+  }
+  chain input { type filter hook input priority -5; policy accept; ip saddr @nets drop; }
+  chain forward { type filter hook forward priority -5; policy accept; ip saddr @nets drop; }
+}
+EOF
+      ;;
+    *) die "未找到 firewalld / iptables+ipset / nftables，无法封禁网段" ;;
+  esac
+}
+
+# 开机恢复：firewalld 自己会持久化，ipset / nft 需要开机重建
+persist_nets() {
+  [ "$(net_backend)" = firewalld ] && return 0
+  command -v systemctl >/dev/null 2>&1 || { warn "非 systemd 系统，网段封禁重启后不会自动恢复，开机后请执行: ssh-guard.sh apply-nets"; return 0; }
+  # 只导出需要的函数，生成独立的恢复脚本，开机时不依赖网络
+  {
+    echo '#!/usr/bin/env bash'
+    echo "$MARK：开机重建 IP 段封禁，由 ssh-guard banlog 生成"
+    declare -p NETS_FILE NET_SET
+    echo "R='' G='' Y='' B='' N=''"
+    declare -f info ok warn die need_root net_backend apply_nets
+    echo 'apply_nets'
+  } >"$NETS_RESTORE"
+  chmod 755 "$NETS_RESTORE"
+  cat >"$NETS_UNIT" <<EOF
+$MARK
+[Unit]
+Description=ssh-guard: restore blocked IP ranges
+After=network-pre.target docker.service firewalld.service
+Before=fail2ban.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$NETS_RESTORE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable ssh-guard-nets.service >/dev/null 2>&1 || warn "ssh-guard-nets.service 启用失败"
+}
+
+clear_nets() {
+  case "$(net_backend)" in
+    ipset)
+      local chain
+      for chain in INPUT DOCKER-USER; do
+        while iptables -D "$chain" -m set --match-set "$NET_SET" src -j DROP 2>/dev/null; do :; done
+      done
+      ipset destroy "$NET_SET" 2>/dev/null ;;
+    firewalld)
+      firewall-cmd --permanent --zone=drop --remove-source="ipset:$NET_SET" >/dev/null 2>&1
+      firewall-cmd --permanent --delete-ipset="$NET_SET" >/dev/null 2>&1
+      firewall-cmd --reload >/dev/null 2>&1 ;;
+    nft) nft delete table inet ssh_guard 2>/dev/null ;;
+  esac
+  if [ -f "$NETS_UNIT" ]; then
+    systemctl disable ssh-guard-nets.service >/dev/null 2>&1
+    rm -f "$NETS_UNIT"; systemctl daemon-reload >/dev/null 2>&1
+  fi
+  rm -f "$NETS_RESTORE" "$NETS_FILE"
+}
+
+# 根据日志算出要封的 IP 和网段，写到 $1/ban_ips（IP<TAB>次数）和 $1/ban_nets（网段<TAB>IP数<TAB>次数）
+plan_bans() {
+  local d=$1
+  collect_ignoreip
+  # 白名单 = jail 的 ignoreip + 当前登录会话 + 日志里成功登录过的 IP（防止误封自己人输错密码）
+  { printf '%s\n' $IGNORE_LIST; cat "$d/accepted"; } | grep . >"$d/whitelist"
+  [ -f "$NETS_FILE" ] && cp "$NETS_FILE" "$d/nets" || : >"$d/nets"
+  awk -F'\t' -v MIN="$BAN_MIN" -v SMIN="$SUBNET_MIN" -v NOSUB="$NO_SUBNET" \
+      -v WL="$d/whitelist" -v BANNED="$d/banned" -v NETS="$d/nets" \
+      -v OUT_IP="$d/ban_ips" -v OUT_NET="$d/ban_nets" '
+    function ip2n(ip,   a) { split(ip, a, "."); return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4] }
+    function is_v4(s) { return s ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/ }
+    function in_wl(ip,   n, i) {
+      if (ip in wlx) return 1
+      if (!is_v4(ip)) return 0
+      n = ip2n(ip)
+      for (i = 1; i <= nw; i++) if (n >= ws[i] && n <= we[i]) return 1
+      return 0
+    }
+    # 网段 [s, s+255] 与任一白名单范围重叠则不封
+    function net_conflict(s,   i) {
+      for (i = 1; i <= nw; i++) if (ws[i] <= s + 255 && we[i] >= s) return 1
+      return 0
+    }
+    # 内网、保留地址不按网段封
+    function reserved(ip,   a) {
+      split(ip, a, ".")
+      return a[1] == 0 || a[1] == 10 || a[1] == 127 || a[1] >= 224 || (a[1] == 172 && a[2] >= 16 && a[2] <= 31) \
+        || (a[1] == 192 && a[2] == 168) || (a[1] == 169 && a[2] == 254) || (a[1] == 100 && a[2] >= 64 && a[2] <= 127)
+    }
+    BEGIN {
+      while ((getline l < WL) > 0) {
+        wlx[l] = 1
+        if (!is_v4(l)) continue
+        bits = 32; ip = l
+        if (l ~ /\//) { split(l, p, "/"); ip = p[1]; bits = p[2] + 0 }
+        size = 2 ^ (32 - bits); s = ip2n(ip); s = s - s % size
+        nw++; ws[nw] = s; we[nw] = s + size - 1
+      }
+      while ((getline l < BANNED) > 0) banned[l] = 1
+      while ((getline l < NETS) > 0) { sub(/\.0\/24$/, "", l); oldnet[l] = 1 }
+    }
+    {
+      c = $1; ip = $2
+      if (in_wl(ip)) next
+      if (is_v4(ip)) { k = ip; sub(/\.[0-9]+$/, "", k); u[k]++; t[k] += c }
+      if (c >= MIN && !(ip in banned)) cand[ip] = c
+    }
+    END {
+      if (!NOSUB) for (k in u) {
+        if (u[k] < SMIN || (k in oldnet) || reserved(k ".0") || net_conflict(ip2n(k ".0"))) continue
+        newnet[k] = 1
+        printf "%s.0/24\t%d\t%d\n", k, u[k], t[k] > OUT_NET
+      }
+      for (ip in cand) {
+        if (is_v4(ip)) { k = ip; sub(/\.[0-9]+$/, "", k); if ((k in newnet) || (k in oldnet)) continue }
+        printf "%s\t%d\n", ip, cand[ip] > OUT_IP
+      }
+    }' "$d/stats"
+  touch "$d/ban_ips" "$d/ban_nets"
+  sort -t"$(printf '\t')" -k2,2nr -o "$d/ban_ips" "$d/ban_ips"
+  sort -t"$(printf '\t')" -k2,2nr -o "$d/ban_nets" "$d/ban_nets"
+}
+
+do_banlog() {
+  need_root
+  command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client status sshd >/dev/null 2>&1 \
+    || die "fail2ban 的 sshd jail 没有运行，请先执行 install"
+  local tmp n_ip n_net
+  tmp=$(mktemp -d)
+  if ! build_stats "$tmp"; then rm -rf "$tmp"; ok "日志中没有爆破记录"; return "${BANLOG_EMPTY_RC:-0}"; fi
+  plan_bans "$tmp"
+  n_ip=$(grep -c . "$tmp/ban_ips")
+  n_net=$(grep -c . "$tmp/ban_nets")
+
+  info "白名单（不会被封，所在网段也不会被封）: $(grep -c . "$tmp/whitelist") 个，含日志中成功登录过的 IP"
+  info "待封禁: $n_ip 个 IP（失败 ≥ $BAN_MIN 次），$n_net 个 /24 网段（≥ $SUBNET_MIN 个 IP 参与爆破）"
+  if [ "$n_net" -gt 0 ]; then
+    echo "---- 网段（前 20）----"
+    printf '%-20s %6s %6s\n' 网段 IP数 次数
+    head -n 20 "$tmp/ban_nets" | awk -F'\t' '{printf "%-20s %6d %6d\n", $1, $2, $3}'
+  fi
+  if [ "$n_ip" -gt 0 ]; then
+    echo "---- IP（前 20，已被上面网段覆盖的不再单独列出）----"
+    head -n 20 "$tmp/ban_ips" | awk -F'\t' '{printf "%-39s %6d 次\n", $1, $2}'
+  fi
+  if [ "$n_ip" -eq 0 ] && [ "$n_net" -eq 0 ]; then rm -rf "$tmp"; ok "没有需要新封禁的 IP 或网段"; return "${BANLOG_EMPTY_RC:-0}"; fi
+  if [ "$DRY_RUN" = 1 ]; then rm -rf "$tmp"; info "预览模式，未做任何修改"; return 0; fi
+
+  if [ "$n_ip" -gt 0 ]; then
+    info "封禁 IP ..."
+    # 每批 200 个；老版本 fail2ban 不支持一次多个时逐个封
+    cut -f1 "$tmp/ban_ips" | xargs -n 200 sh -c 'fail2ban-client set sshd banip "$@" >/dev/null 2>&1 \
+      || for ip in "$@"; do fail2ban-client set sshd banip "$ip" >/dev/null 2>&1; done' _
+    ok "已通过 fail2ban 封禁 $n_ip 个 IP（bantime 与 sshd jail 相同）"
+  fi
+  if [ "$n_net" -gt 0 ]; then
+    info "封禁网段 ..."
+    mkdir -p "$(dirname "$NETS_FILE")"
+    touch "$NETS_FILE"
+    { cat "$NETS_FILE"; cut -f1 "$tmp/ban_nets"; } | grep . | sort -u -t. -k1,1n -k2,2n -k3,3n -o "$NETS_FILE"
+    apply_nets
+    persist_nets
+    ok "已永久封禁 $n_net 个网段（共 $(grep -c . "$NETS_FILE") 个，列表: $NETS_FILE）"
+  fi
   rm -rf "$tmp"
 }
 
@@ -549,17 +810,37 @@ do_status() {
     echo; info "最近封禁的 20 个 IP："
     printf '%s\n' "$list" | sort -k2,3 | tail -n 20 | sed 's/^/      /'
   fi
+  if [ -s "$NETS_FILE" ]; then
+    echo; info "已封禁网段 $(grep -c . "$NETS_FILE") 个（$NETS_FILE），最近 10 个："
+    tail -n 10 "$NETS_FILE" | sed 's/^/      /'
+  fi
   echo
   info "SSH 密码登录：$(sshd_opt passwordauthentication)"
 }
 
+# 支持单个 IP 和网段（如 1.2.3.0/24）；解封的 IP 若所在网段被封会给出提示
 do_unban() {
   need_root
-  [ $# -gt 0 ] || die "用法: ssh-guard.sh unban <IP>..."
-  local ip
+  [ $# -gt 0 ] || die "用法: ssh-guard.sh unban <IP 或 网段>..."
+  local ip net nets_changed=0
   for ip in "$@"; do
-    fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1 && ok "已解封 $ip" || warn "$ip 不在封禁列表中"
+    case "$ip" in
+      */*)
+        if [ -f "$NETS_FILE" ] && grep -qxF "$ip" "$NETS_FILE"; then
+          grep -vxF "$ip" "$NETS_FILE" >"$NETS_FILE.tmp"; mv -f "$NETS_FILE.tmp" "$NETS_FILE"
+          nets_changed=1; ok "已解封网段 $ip"
+        else
+          warn "$ip 不在网段封禁列表中"
+        fi ;;
+      *)
+        fail2ban-client set sshd unbanip "$ip" >/dev/null 2>&1 && ok "已解封 $ip" || warn "$ip 不在 fail2ban 封禁列表中"
+        net="${ip%.*}.0/24"
+        [ -f "$NETS_FILE" ] && grep -qxF "$net" "$NETS_FILE" \
+          && warn "$ip 所在网段 $net 仍被封禁，如需放行执行: ssh-guard.sh unban $net" ;;
+    esac
   done
+  [ "$nets_changed" = 1 ] && apply_nets
+  return 0
 }
 
 do_uninstall() {
@@ -568,6 +849,10 @@ do_uninstall() {
   command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1
   svc restart fail2ban || true
   ok "已移除 ssh-guard 的 fail2ban 配置（fail2ban 恢复系统默认配置）"
+  if [ -f "$NETS_FILE" ] || [ -f "$NETS_UNIT" ]; then
+    clear_nets
+    ok "已移除网段封禁"
+  fi
   [ -f "$SSHD_DROPIN" ] || grep -qF "$MARK begin" "$SSHD_CONFIG" 2>/dev/null \
     && info "密码登录仍是关闭状态，如需恢复执行: ssh-guard.sh unharden"
   return 0
@@ -701,12 +986,15 @@ menu_deploy() {
 
   echo "在这些服务器上执行："
   echo "  1) 安装/更新防护    2) 爆破分析报告    3) 查看封禁状态    4) 关闭密码登录"
+  echo "  5) 一键封禁日志中的爆破 IP 和 IP 段    6) 预览将要封禁的 IP 和 IP 段（不修改）"
   ask opt "请选择" 1
   case "$opt" in
     1) ask_install_opts; remote=("${INSTALL_ARGS[@]}") ;;
     2) ask_int TOP "每台显示前几个 IP" 10; remote=(report --top "$TOP") ;;
     3) remote=(status) ;;
     4) confirm "确认所有服务器都已配置公钥并测试过密钥登录" n || return 0; remote=(harden) ;;
+    5) ask_banlog_opts; remote=("${BANLOG_ARGS[@]}") ;;
+    6) ask_banlog_opts; remote=("${BANLOG_ARGS[@]}" --dry-run) ;;
     *) warn "无效选择"; return 1 ;;
   esac
   ask_int parallel "并发数" 10
@@ -715,26 +1003,43 @@ menu_deploy() {
 
   args=(-f "$hosts_file" -P "$parallel" -u "$user")
   [ -n "$identity" ] && args+=(-i "$identity")
-  case "${remote[0]}" in report|status) args+=(-s) ;; esac
+  case "${remote[0]}" in report|status|banlog) args+=(-s) ;; esac
   confirm "开始执行 ssh-guard.sh ${remote[*]}" y || return 0
   ( do_deploy "${args[@]}" -- "${remote[@]}" )
 }
 
+# 交互式收集 banlog 参数，结果放在 BANLOG_ARGS
+ask_banlog_opts() {
+  ask_int BAN_MIN "失败至少几次的 IP 才封（1 = 日志中所有爆破 IP）" "$BAN_MIN"
+  if confirm "同时封禁爆破集中的 /24 网段" y; then
+    NO_SUBNET=0
+    ask_int SUBNET_MIN "同一 /24 中至少几个 IP 参与爆破才封整段" "$SUBNET_MIN"
+  else
+    NO_SUBNET=1
+  fi
+  ask SINCE "只分析某时间之后的日志（如 7 days ago，留空为全部）" ""
+  BANLOG_ARGS=(banlog --min "$BAN_MIN" --subnet-min "$SUBNET_MIN")
+  [ "$NO_SUBNET" = 1 ] && BANLOG_ARGS+=(--no-subnet)
+  [ -n "$SINCE" ] && BANLOG_ARGS+=(--since "$SINCE")
+  return 0
+}
+
 do_menu() {
   local choice ips root_tip=""
-  [ "$(id -u)" -eq 0 ] || root_tip="  （当前不是 root，只能使用 7 批量部署；其他功能请用 sudo 运行）"
+  [ "$(id -u)" -eq 0 ] || root_tip="  （当前不是 root，只能使用 8 批量部署；其他功能请用 sudo 运行）"
   while true; do
     cat <<EOF
 
 =================== ssh-guard $VERSION ===================
   1) 安装/更新防护（fail2ban aggressive 模式 + 自动封禁）
   2) 爆破分析报告（Top IP、首/末次时间、/24 网段）
-  3) 查看封禁状态
-  4) 解封 IP
-  5) 关闭 SSH 密码登录（仅允许密钥）
-  6) 恢复 SSH 密码登录
-  7) 批量部署到多台服务器
-  8) 卸载 ssh-guard 的 fail2ban 配置
+  3) 一键封禁日志中的爆破 IP 和 IP 段
+  4) 查看封禁状态
+  5) 解封 IP 或 IP 段
+  6) 关闭 SSH 密码登录（仅允许密钥）
+  7) 恢复 SSH 密码登录
+  8) 批量部署到多台服务器
+  9) 卸载 ssh-guard 的 fail2ban 配置和网段封禁
   0) 退出
 $root_tip
 EOF
@@ -745,17 +1050,22 @@ EOF
       2) ask_int TOP "显示前几个 IP" "$TOP"
          ask SINCE "只看某时间之后的日志（如 24 hours ago，留空为全部）" ""
          ( do_report ) ;;
-      3) ( do_status ) ;;
-      4) ask ips "要解封的 IP（空格分隔）" ""
+      3) ask_banlog_opts
+         # 先预览，确认后再执行
+         if ( DRY_RUN=1 BANLOG_EMPTY_RC=2; do_banlog ) && confirm "确认封禁以上 IP 和网段" n; then
+           ( DRY_RUN=0; do_banlog )
+         fi ;;
+      4) ( do_status ) ;;
+      5) ask ips "要解封的 IP 或网段（如 1.2.3.4 5.6.7.0/24，空格分隔）" ""
          # shellcheck disable=SC2086
          [ -n "$ips" ] && ( do_unban $ips ) ;;
-      5) if confirm "确认已配置公钥，并已在另一个窗口测试过密钥登录" n; then
+      6) if confirm "确认已配置公钥，并已在另一个窗口测试过密钥登录" n; then
            if confirm "没检测到公钥时也强制关闭（可能把自己锁在外面）" n; then FORCE=1; else FORCE=0; fi
            ( do_harden )
          fi ;;
-      6) ( do_unharden ) ;;
-      7) menu_deploy ;;
-      8) confirm "确认移除 ssh-guard 的 fail2ban 配置" n && ( do_uninstall ) ;;
+      7) ( do_unharden ) ;;
+      8) menu_deploy ;;
+      9) confirm "确认移除 ssh-guard 的 fail2ban 配置和网段封禁" n && ( do_uninstall ) ;;
       0|q|Q|exit) exit 0 ;;
       *) warn "无效选择"; continue ;;
     esac
@@ -785,6 +1095,10 @@ while [ $# -gt 0 ]; do
     --since) SINCE=${2:?}; shift 2 ;;
     --top) TOP=${2:?}; shift 2 ;;
     --log) LOGFILE=${2:?}; shift 2 ;;
+    --min) BAN_MIN=${2:?}; shift 2 ;;
+    --subnet-min) SUBNET_MIN=${2:?}; shift 2 ;;
+    --no-subnet) NO_SUBNET=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -v|--version) echo "ssh-guard $VERSION"; exit 0 ;;
     -*) die "未知选项: $1（ssh-guard.sh help 查看用法）" ;;
@@ -799,6 +1113,8 @@ case "$CMD" in
   harden) do_harden ;;
   unharden) do_unharden ;;
   status) do_status ;;
+  banlog) do_banlog ;;
+  apply-nets) apply_nets ;;
   unban) do_unban "${ARGS[@]+"${ARGS[@]}"}" ;;
   uninstall) do_uninstall ;;
   help) usage ;;

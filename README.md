@@ -8,6 +8,7 @@ SSH 爆破防护一键脚本，基于 fail2ban：
 - **自动白名单**：当前登录会话的来源 IP 自动加入 ignoreip，避免把自己封掉
 - **爆破分析报告**：失败次数 Top IP、首次/末次出现时间、是否已封、/24 网段汇总
 - **一键封禁日志中的爆破 IP 和 IP 段**：IP 交给 fail2ban 封；同一 /24 有多个 IP 参与爆破时封整段（独立的 hash:net 集合，重启自动恢复）；白名单和成功登录过的 IP 不会误封
+- **启用密钥登录**：给用户添加公钥（粘贴 / 从 GitHub 账号导入 / 服务器上生成），自动修正 `.ssh` 权限并确保 sshd 开启公钥认证；可批量把本机公钥推送到只能密码登录的服务器
 - **关闭密码登录**（可选）：先检查是否配置了公钥，`sshd -t` 校验失败自动回滚
 - 兼容 Debian / Ubuntu / CentOS / Rocky / Alma / openSUSE / Alpine；iptables / nftables / firewalld；auth.log / secure / journal；OpenSSH 9.8+ 的 `sshd-session`
 
@@ -26,10 +27,11 @@ curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard
   3) 一键封禁日志中的爆破 IP 和 IP 段
   4) 查看封禁状态
   5) 解封 IP 或 IP 段
-  6) 关闭 SSH 密码登录（仅允许密钥）
-  7) 恢复 SSH 密码登录
-  8) 批量部署到多台服务器
-  9) 卸载 ssh-guard 的 fail2ban 配置和网段封禁
+  6) 启用 SSH 密钥登录（添加公钥）
+  7) 关闭 SSH 密码登录（仅允许密钥）
+  8) 恢复 SSH 密码登录
+  9) 批量部署到多台服务器
+ 10) 卸载 ssh-guard 的 fail2ban 配置和网段封禁
   0) 退出
 ```
 
@@ -50,6 +52,11 @@ curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard
 curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- banlog --dry-run
 curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- banlog
 
+# 启用密钥登录：导入 GitHub 账号上的公钥 / 直接给出公钥 / 在服务器上生成密钥对
+curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- addkey --github your-github-name
+curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- addkey --key "ssh-ed25519 AAAA... me@pc"
+curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- addkey --generate
+
 # 安装防护，同时关闭密码登录（请先确认密钥能登录）
 curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- install --disable-password
 ```
@@ -68,6 +75,7 @@ sudo ./ssh-guard.sh help
 | `menu` | 交互菜单（有终端时不带参数的默认行为） |
 | `install` | 安装/更新 fail2ban 防护（无终端时的默认行为） |
 | `report` | 爆破分析报告 |
+| `addkey` | 启用 SSH 密钥登录：添加公钥 |
 | `harden` | 关闭密码登录，只允许密钥 |
 | `unharden` | 撤销 harden |
 | `status` | 查看封禁情况 |
@@ -89,6 +97,19 @@ sudo ./ssh-guard.sh help
 | `--disable-password` | | 安装后顺便执行 harden |
 
 `report` 选项：`--since "24 hours ago"`（只对 journal 有效）、`--top N`、`--log FILE`。
+
+`addkey` 选项（公钥来源至少一种，可组合）：
+
+| 选项 | 说明 |
+| --- | --- |
+| `--user USER` | 给哪个用户添加，默认为 sudo 前的原用户，否则 root |
+| `--key "ssh-ed25519 AAAA..."` | 直接给出公钥，可重复 |
+| `--key-file FILE` | 从文件读取公钥（可多行） |
+| `--github NAME` | 导入 `https://github.com/NAME.keys` 的全部公钥 |
+| `--generate` | 在服务器上生成 ed25519 密钥对并打印私钥；私钥副本在 `/root/ssh-guard-keys/`，保存到本机后请删除 |
+| `--disable-password` | 添加后顺便关闭密码登录（确认密钥可用时再用） |
+
+会校验公钥格式、跳过已存在的公钥，修正 `~/.ssh` 为 700、`authorized_keys` 为 600（SELinux 下执行 restorecon）；sshd 若关闭了 `PubkeyAuthentication` 会自动打开（校验失败回滚）。
 
 `harden` 选项：`--force`（没检测到公钥也强制关闭，慎用）。
 
@@ -133,8 +154,17 @@ curl -fsSL $S | bash -s -- deploy -f hosts.txt -P 20 -i ~/.ssh/id_ed25519 -- sta
 | `-i, --identity KEY` | SSH 私钥 |
 | `-u, --user USER` | 未写用户名时的默认用户（默认 root） |
 | `-s, --show` | 结束后打印每台服务器的输出 |
+| `-p, --password` | 目标服务器还没有密钥时用密码登录，逐台连接并提示输入密码 |
 
 `--` 后面是要在远程执行的命令和参数，默认 `install`。每台服务器的输出保存在 `ssh-guard-logs/<时间>/<host>.log`。要求本机能用密钥免密登录这些服务器；非 root 用户需要免密 sudo。执行 deploy 的这台机器的 IP 会自动加入各服务器的白名单。
+
+**批量启用密钥登录**：把本机公钥推送到一批目前只能密码登录的服务器（菜单 9 → 7 会自动找本机公钥，没有则帮你生成）：
+
+```bash
+curl -fsSL $S | bash -s -- deploy -f hosts.txt -p -- addkey --key "$(cat ~/.ssh/id_ed25519.pub)"
+```
+
+密码模式下用 root 登录最省事；用普通用户时需要该用户有免密 sudo。
 
 ## 写入的文件
 
@@ -145,6 +175,8 @@ curl -fsSL $S | bash -s -- deploy -f hosts.txt -P 20 -i ~/.ssh/id_ed25519 -- sta
 | `/etc/fail2ban/filter.d/ssh-guard-sshd.conf` | 仅 OpenSSH 9.8+ 且 fail2ban < 1.1 时，兼容 `sshd-session` |
 | `/etc/systemd/system/fail2ban.service.d/ssh-guard.conf` | 有 Docker 时让 fail2ban 在 Docker 之后启动 |
 | `/etc/ssh/sshd_config.d/00-ssh-guard.conf` | harden 写入；不支持 Include 时改为插入到 `sshd_config` 开头 |
+| `/etc/ssh/sshd_config.d/00-ssh-guard-pubkey.conf` | 仅当 sshd 关闭了公钥认证时由 addkey 写入 |
+| `/root/ssh-guard-keys/` | `addkey --generate` 生成的密钥对（私钥保存到本机后请删除） |
 | `/etc/ssh-guard/blocked-nets.txt` | banlog 封禁的网段列表 |
 | `/usr/local/sbin/ssh-guard-nets-restore`、`ssh-guard-nets.service` | 开机重建网段封禁（firewalld 自身会持久化，不需要） |
 

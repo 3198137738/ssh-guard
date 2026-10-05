@@ -12,7 +12,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- install
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 RAW_URL="https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh"
 JAIL_FILE=/etc/fail2ban/jail.d/ssh-guard.local
 F2B_CONF_FILE=/etc/fail2ban/fail2ban.d/ssh-guard.local
@@ -21,6 +21,8 @@ FILTER_FILE=/etc/fail2ban/filter.d/${FILTER_NAME}.conf
 SYSTEMD_DROPIN=/etc/systemd/system/fail2ban.service.d/ssh-guard.conf
 SSHD_CONFIG=/etc/ssh/sshd_config
 SSHD_DROPIN=/etc/ssh/sshd_config.d/00-ssh-guard.conf
+SSHD_PUBKEY_DROPIN=/etc/ssh/sshd_config.d/00-ssh-guard-pubkey.conf
+KEYS_DIR=/root/ssh-guard-keys
 MARK="# managed by ssh-guard"
 NETS_FILE=/etc/ssh-guard/blocked-nets.txt
 NET_SET=ssh-guard-net
@@ -42,6 +44,11 @@ BAN_MIN=1
 SUBNET_MIN=3
 NO_SUBNET=0
 DRY_RUN=0
+KEY_USER=""
+KEY_TEXT=""
+KEY_FILE=""
+KEY_GITHUB=""
+KEY_GEN=0
 
 if [ -t 1 ]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' B=$'\e[36m' N=$'\e[0m'; else R='' G='' Y='' B='' N=''; fi
 info() { printf '%s[*]%s %s\n' "$B" "$N" "$*"; }
@@ -58,6 +65,7 @@ usage() {
   menu                 交互菜单
   install              安装/更新 fail2ban 防护（可重复执行）
   report               分析 SSH 爆破日志：Top IP、首/末次时间、是否已封、/24 网段汇总
+  addkey               启用 SSH 密钥登录：给用户添加公钥（粘贴 / GitHub 导入 / 服务器上生成）
   harden               关闭 SSH 密码登录，只允许密钥（会先检查是否已配置公钥）
   unharden             撤销 harden，恢复原来的密码登录设置
   status               查看当前封禁情况
@@ -75,6 +83,14 @@ install 选项:
   --ignoreip "IP ..."  白名单，空格或逗号分隔；当前登录会话的 IP 会自动加入
   --no-docker          不在 DOCKER-USER 链封禁
   --disable-password   安装完成后顺便执行 harden
+
+addkey 选项（公钥来源至少选一种，可组合）:
+  --user USER          给哪个用户添加（默认: 通过 sudo 调用时为原用户，否则 root）
+  --key "ssh-ed25519 AAAA..."  直接给出公钥，可重复
+  --key-file FILE      从文件读取公钥（可多行）
+  --github NAME        导入 https://github.com/NAME.keys 中的全部公钥
+  --generate           在服务器上生成 ed25519 密钥对，并打印私钥供保存
+  --disable-password   添加完成后顺便关闭密码登录（确认密钥可用时再用）
 
 harden 选项:
   --force              未检测到任何 authorized_keys 也强制关闭密码登录（可能把自己锁在外面）
@@ -97,6 +113,7 @@ deploy 用法: ssh-guard.sh deploy -f hosts.txt [选项] [-- 远程命令和参�
   -i, --identity KEY   SSH 私钥
   -u, --user USER      未写用户名时的默认用户（默认 root）
   -s, --show           结束后打印每台服务器的输出
+  -p, --password       目标服务器还没有密钥时用密码登录（逐台执行，按提示输入密码）
   要求本机能用密钥免密登录；非 root 用户需要免密 sudo。输出保存在 ./ssh-guard-logs/
 
 示例:
@@ -104,6 +121,8 @@ deploy 用法: ssh-guard.sh deploy -f hosts.txt [选项] [-- 远程命令和参�
   curl -fsSL <RAW_URL> | sudo bash -s -- install --maxretry 5 --ignoreip "1.2.3.4" --disable-password
   curl -fsSL <RAW_URL> | sudo bash -s -- report --since "24 hours ago"
   curl -fsSL <RAW_URL> | sudo bash -s -- banlog --dry-run
+  curl -fsSL <RAW_URL> | sudo bash -s -- addkey --github your-github-name
+  curl -fsSL <RAW_URL> | bash -s -- deploy -f hosts.txt -p -- addkey --key "$(cat ~/.ssh/id_ed25519.pub)"
   curl -fsSL <RAW_URL> | bash -s -- deploy -f hosts.txt -s -- report --top 10
 EOF
 }
@@ -722,16 +741,13 @@ do_banlog() {
 # -------------------------------------------------------------- harden ---
 
 count_pubkeys() {
-  local n=0 files f home
-  files=$(sshd_opt authorizedkeysfile)
-  files=${files:-.ssh/authorized_keys}
-  for home in /root /home/*; do
-    for f in $files; do
-      case "$f" in /*) ;; *) f="$home/$f" ;; esac
-      f=${f//%h/$home}
+  local n=0 f user home _
+  while IFS=: read -r user _ _ _ _ home _; do
+    case "$home" in /root|/home/*) ;; *) continue ;; esac
+    for f in $(authkeys_files "$user" "$home"); do
       [ -f "$f" ] && n=$((n + $(grep -cE '^[^#]*(ssh-|ecdsa-|sk-)' "$f" 2>/dev/null || true)))
     done
-  done
+  done </etc/passwd
   echo "$n"
 }
 
@@ -789,6 +805,135 @@ do_unharden() {
   "$bin" -t || die "sshd 配置校验失败，请手动检查 $SSHD_CONFIG"
   reload_sshd || warn "sshd 重载失败，请手动重载"
   ok "已撤销 harden，当前 PasswordAuthentication = $(sshd_opt passwordauthentication)"
+}
+
+# -------------------------------------------------------------- addkey ---
+
+user_home() {
+  if command -v getent >/dev/null 2>&1; then getent passwd "$1" | cut -d: -f6
+  else awk -F: -v u="$1" '$1==u{print $6}' /etc/passwd; fi
+}
+
+# 按 sshd 的 AuthorizedKeysFile 展开某用户的公钥文件路径（%h %u %%）
+authkeys_files() {
+  local user=$1 home=$2 files f
+  files=$(sshd_opt authorizedkeysfile)
+  for f in ${files:-.ssh/authorized_keys}; do
+    [ "$f" = none ] && continue
+    f=${f//%h/$home}; f=${f//%u/$user}; f=${f//%%/%}
+    case "$f" in /*) ;; *) f="$home/$f" ;; esac
+    echo "$f"
+  done
+}
+
+# 提取公钥本体（base64 部分），用于判重；行首可能带 from="..." 等选项
+key_body() { awk '{for (i = 1; i <= NF; i++) if ($i ~ /^AAAA/) { print $i; exit }}'; }
+
+# sshd 没开公钥认证时打开（极少见，多数发行版默认开启）
+ensure_pubkey_auth() {
+  [ "$(sshd_opt pubkeyauthentication)" = no ] || return 0
+  local bin bak
+  bin=$(sshd_bin) || die "找不到 sshd"
+  bak="$SSHD_CONFIG.ssh-guard.bak.$(date +%Y%m%d%H%M%S)"
+  cp -p "$SSHD_CONFIG" "$bak"
+  if [ -d "$(dirname "$SSHD_PUBKEY_DROPIN")" ] && grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$SSHD_CONFIG"; then
+    printf '%s\nPubkeyAuthentication yes\n' "$MARK" >"$SSHD_PUBKEY_DROPIN"
+  fi
+  if [ "$(sshd_opt pubkeyauthentication)" != yes ]; then
+    rm -f "$SSHD_PUBKEY_DROPIN"
+    { echo "$MARK pubkey begin"; echo "PubkeyAuthentication yes"; echo "$MARK pubkey end"; cat "$bak"; } >"$SSHD_CONFIG"
+  fi
+  if ! "$bin" -t 2>/tmp/ssh-guard-sshd.err || [ "$(sshd_opt pubkeyauthentication)" != yes ]; then
+    cp -p "$bak" "$SSHD_CONFIG"; rm -f "$SSHD_PUBKEY_DROPIN"
+    cat /tmp/ssh-guard-sshd.err >&2
+    die "开启 PubkeyAuthentication 失败，已回滚 sshd 配置"
+  fi
+  reload_sshd || warn "sshd 重载失败，请手动执行 systemctl reload ssh 或 sshd"
+  ok "已开启 sshd 公钥认证（原配置备份: $bak）"
+}
+
+do_addkey() {
+  need_root
+  command -v ssh-keygen >/dev/null 2>&1 || pkg_install openssh-client >/dev/null 2>&1 || true
+  command -v ssh-keygen >/dev/null 2>&1 || die "找不到 ssh-keygen"
+  # 默认给通过 sudo 调用的那个用户加，否则给 root
+  local user=${KEY_USER:-${SUDO_USER:-root}} home akf tmp one line body added=0 skipped=0 genkey=""
+  home=$(user_home "$user")
+  [ -n "$home" ] || die "用户 $user 不存在"
+  tmp=$(mktemp -d)
+
+  [ -n "$KEY_TEXT" ] && printf '%s\n' "$KEY_TEXT" >>"$tmp/keys"
+  if [ -n "$KEY_FILE" ]; then
+    [ -f "$KEY_FILE" ] || { rm -rf "$tmp"; die "公钥文件不存在: $KEY_FILE"; }
+    cat "$KEY_FILE" >>"$tmp/keys"
+  fi
+  if [ -n "$KEY_GITHUB" ]; then
+    info "从 https://github.com/$KEY_GITHUB.keys 获取公钥 ..."
+    { curl -fsSL "https://github.com/$KEY_GITHUB.keys" 2>/dev/null || wget -qO- "https://github.com/$KEY_GITHUB.keys" 2>/dev/null; } >"$tmp/gh" \
+      && [ -s "$tmp/gh" ] || { rm -rf "$tmp"; die "获取失败：用户名不存在、该账号未上传公钥，或服务器访问不了 GitHub"; }
+    cat "$tmp/gh" >>"$tmp/keys"
+  fi
+  if [ "$KEY_GEN" = 1 ]; then
+    mkdir -p "$KEYS_DIR"; chmod 700 "$KEYS_DIR"
+    genkey="$KEYS_DIR/${user}@$(hostname)_ed25519"
+    rm -f "$genkey" "$genkey.pub"
+    ssh-keygen -q -t ed25519 -N "" -C "${user}@$(hostname) ssh-guard $(date +%F)" -f "$genkey" \
+      || { rm -rf "$tmp"; die "生成密钥失败"; }
+    cat "$genkey.pub" >>"$tmp/keys"
+  fi
+  [ -s "$tmp/keys" ] || { rm -rf "$tmp"; die "没有提供公钥：请用 --key / --key-file / --github / --generate"; }
+
+  akf=$(authkeys_files "$user" "$home" | head -n1)
+  [ -n "$akf" ] || { rm -rf "$tmp"; die "sshd 的 AuthorizedKeysFile 为 none，无法添加公钥"; }
+  mkdir -p "$(dirname "$akf")"
+  touch "$akf"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(printf '%s' "$line" | tr -d '\r')
+    case "$line" in ''|'#'*) continue ;; esac
+    printf '%s\n' "$line" >"$tmp/one"
+    if ! ssh-keygen -l -f "$tmp/one" >/dev/null 2>&1; then
+      warn "不是有效的公钥，已跳过: ${line:0:50}..."; continue
+    fi
+    body=$(key_body <"$tmp/one")
+    if [ -n "$body" ] && grep -qF "$body" "$akf"; then
+      skipped=$((skipped + 1)); continue
+    fi
+    # 原文件末尾没有换行时先补一个，避免两把公钥粘在同一行
+    [ -s "$akf" ] && [ "$(tail -c1 "$akf" | od -An -c | tr -d ' ')" != '\n' ] && echo >>"$akf"
+    printf '%s\n' "$line" >>"$akf"
+    added=$((added + 1))
+    printf '      + %s\n' "$(ssh-keygen -l -f "$tmp/one" 2>/dev/null)"
+  done <"$tmp/keys"
+  rm -rf "$tmp"
+
+  # 权限不对 sshd 会直接忽略公钥（StrictModes）
+  case "$akf" in
+    "$home"/*)
+      chown "$user": "$(dirname "$akf")" "$akf" 2>/dev/null || chown "$user" "$(dirname "$akf")" "$akf"
+      chmod 700 "$(dirname "$akf")"; chmod 600 "$akf" ;;
+    *) chown root: "$akf" 2>/dev/null; chmod 644 "$akf" ;;
+  esac
+  command -v restorecon >/dev/null 2>&1 && restorecon -R "$(dirname "$akf")" >/dev/null 2>&1
+
+  ensure_pubkey_auth
+  ok "用户 $user：新增 $added 把公钥，已存在 $skipped 把（$akf，共 $(grep -cE '^[^#]*(ssh-|ecdsa-|sk-)' "$akf") 把）"
+  if [ "$user" = root ] && [ "$(sshd_opt permitrootlogin)" = no ]; then
+    warn "PermitRootLogin 为 no，root 即使有公钥也无法登录，请改用普通用户或调整 sshd 配置"
+  fi
+  if [ -n "$genkey" ]; then
+    echo
+    warn "已生成新密钥对，下面是私钥，请立即保存到本机（如 ~/.ssh/$(basename "$genkey")，权限 600）："
+    echo "-----------------------------------------------------------------"
+    cat "$genkey"
+    echo "-----------------------------------------------------------------"
+    info "私钥副本: $genkey（保存到本机后请删除: rm -f $genkey）"
+    info "本机登录: ssh -i ~/.ssh/$(basename "$genkey") $user@<服务器IP>"
+  fi
+  echo
+  info "请另开一个窗口测试密钥登录，成功后可关闭密码登录: ssh-guard.sh harden"
+  [ "$DISABLE_PW" = 1 ] && { echo; do_harden; }
+  return 0
 }
 
 # ------------------------------------------------------- status/unban ---
@@ -880,8 +1025,10 @@ deploy_one() {
   name=$host
   [ "$port" != 22 ] && name="$host-$port"
 
-  local opts=(-p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+  local opts=(-p "$port" -o BatchMode="$DEPLOY_BATCH" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
   [ -n "$DEPLOY_IDENTITY" ] && opts+=(-i "$DEPLOY_IDENTITY")
+  # 密码模式：ssh 从 /dev/tty 读密码，不影响 stdin 传脚本
+  [ "$DEPLOY_BATCH" = no ] && echo "[*] 连接 $user@$host:$port（如提示请输入密码）"
   ssh "${opts[@]}" "$user@$host" "$DEPLOY_CMD" <"$DEPLOY_SCRIPT" >"$DEPLOY_LOG_DIR/$name.log" 2>&1
   rc=$?
   echo "$rc" >"$DEPLOY_LOG_DIR/$name.rc"
@@ -890,9 +1037,10 @@ deploy_one() {
 
 do_deploy() {
   local hosts_file="" parallel=10 show=0
-  DEPLOY_IDENTITY="" DEPLOY_USER=root
+  DEPLOY_IDENTITY="" DEPLOY_USER=root DEPLOY_BATCH=yes
   while [ $# -gt 0 ]; do
     case "$1" in
+      -p|--password) DEPLOY_BATCH=no; shift ;;
       -f|--hosts) hosts_file=${2:?}; shift 2 ;;
       -P|--parallel) parallel=${2:?}; shift 2 ;;
       -i|--identity) DEPLOY_IDENTITY=${2:?}; shift 2 ;;
@@ -913,9 +1061,13 @@ do_deploy() {
   # sudo 会清掉 SSH_CLIENT，显式传进去，让远程把本机 IP 加入白名单
   local args; args=$(printf '%q ' "$@")
   DEPLOY_CMD="if [ \"\$(id -u)\" -eq 0 ]; then bash -s -- $args; else sudo -n env SSH_CLIENT=\"\$SSH_CLIENT\" bash -s -- $args; fi"
-  export DEPLOY_SCRIPT DEPLOY_LOG_DIR DEPLOY_CMD DEPLOY_IDENTITY DEPLOY_USER
+  export DEPLOY_SCRIPT DEPLOY_LOG_DIR DEPLOY_CMD DEPLOY_IDENTITY DEPLOY_USER DEPLOY_BATCH
   export -f deploy_one
 
+  if [ "$DEPLOY_BATCH" = no ]; then
+    tty_ok || die "密码模式需要在终端中运行"
+    parallel=1
+  fi
   info "执行: ssh-guard.sh $*    并发: $parallel    日志: $DEPLOY_LOG_DIR/"
   grep -vE '^[[:space:]]*(#|$)' "$hosts_file" | xargs -P "$parallel" -I{} bash -c 'deploy_one "$1"' _ {}
 
@@ -941,7 +1093,8 @@ tty_ok() { { : </dev/tty; } 2>/dev/null; }
 # ask 变量名 提示 [默认值]：从终端读取（curl | bash 时 stdin 是脚本本身，必须读 /dev/tty）
 ask() {
   local __v=""
-  read -r -p "$2${3:+ [$3]}: " __v </dev/tty || true
+  # 输入结束（Ctrl-D）时直接退出，避免菜单死循环
+  read -r -p "$2${3:+ [$3]}: " __v </dev/tty || { echo; exit 0; }
   printf -v "$1" '%s' "${__v:-${3:-}}"
 }
 
@@ -973,8 +1126,40 @@ ask_install_opts() {
   return 0
 }
 
+menu_addkey() {
+  local m
+  ask KEY_USER "给哪个用户添加公钥" "${SUDO_USER:-root}"
+  echo "公钥来源："
+  echo "  1) 粘贴公钥（本机执行 cat ~/.ssh/id_ed25519.pub 得到的一整行）"
+  echo "  2) 从 GitHub 账号导入（https://github.com/<用户名>.keys）"
+  echo "  3) 在服务器上生成新的密钥对（会打印私钥，需要保存到本机）"
+  ask m "请选择" 1
+  KEY_TEXT="" KEY_GITHUB="" KEY_GEN=0
+  case "$m" in
+    1) ask KEY_TEXT "粘贴公钥" ""; [ -n "$KEY_TEXT" ] || { warn "没有输入公钥"; return 1; } ;;
+    2) ask KEY_GITHUB "GitHub 用户名" ""; [ -n "$KEY_GITHUB" ] || { warn "没有输入用户名"; return 1; } ;;
+    3) KEY_GEN=1 ;;
+    *) warn "无效选择"; return 1 ;;
+  esac
+  DISABLE_PW=0
+  ( do_addkey )
+}
+
+# 本机公钥，没有就询问是否生成，结果放在 LOCAL_PUBKEY
+local_pubkey() {
+  local f
+  LOCAL_PUBKEY=""
+  for f in ~/.ssh/id_ed25519.pub ~/.ssh/id_ecdsa.pub ~/.ssh/id_rsa.pub; do
+    [ -f "$f" ] && { LOCAL_PUBKEY=$f; return 0; }
+  done
+  confirm "本机没有 SSH 密钥，现在生成 ~/.ssh/id_ed25519" y || return 1
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 </dev/tty || return 1
+  LOCAL_PUBKEY=~/.ssh/id_ed25519.pub
+}
+
 menu_deploy() {
-  local hosts_file line opt parallel user identity remote=() args=()
+  local hosts_file line opt parallel user identity="" use_pw=0 remote=() args=()
   ask hosts_file "服务器列表文件（每行 [user@]host[:port]，留空则现在逐行输入）" ""
   if [ -z "$hosts_file" ]; then
     hosts_file=$(mktemp)
@@ -987,8 +1172,13 @@ menu_deploy() {
   echo "在这些服务器上执行："
   echo "  1) 安装/更新防护    2) 爆破分析报告    3) 查看封禁状态    4) 关闭密码登录"
   echo "  5) 一键封禁日志中的爆破 IP 和 IP 段    6) 预览将要封禁的 IP 和 IP 段（不修改）"
+  echo "  7) 启用密钥登录（把本机公钥推送到这些服务器）"
   ask opt "请选择" 1
   case "$opt" in
+    7) local_pubkey || return 1
+       info "推送公钥: $LOCAL_PUBKEY"
+       remote=(addkey --key "$(cat "$LOCAL_PUBKEY")")
+       confirm "这些服务器目前只能用密码登录（逐台连接并输入密码）" y && use_pw=1 ;;
     1) ask_install_opts; remote=("${INSTALL_ARGS[@]}") ;;
     2) ask_int TOP "每台显示前几个 IP" 10; remote=(report --top "$TOP") ;;
     3) remote=(status) ;;
@@ -997,12 +1187,13 @@ menu_deploy() {
     6) ask_banlog_opts; remote=("${BANLOG_ARGS[@]}" --dry-run) ;;
     *) warn "无效选择"; return 1 ;;
   esac
-  ask_int parallel "并发数" 10
+  if [ "$use_pw" = 1 ]; then parallel=1; else ask_int parallel "并发数" 10; fi
   ask user "未写用户名时的默认用户" root
-  ask identity "SSH 私钥路径（留空使用默认密钥）" ""
+  [ "$use_pw" = 1 ] || ask identity "SSH 私钥路径（留空使用默认密钥）" ""
 
   args=(-f "$hosts_file" -P "$parallel" -u "$user")
   [ -n "$identity" ] && args+=(-i "$identity")
+  [ "$use_pw" = 1 ] && args+=(-p)
   case "${remote[0]}" in report|status|banlog) args+=(-s) ;; esac
   confirm "开始执行 ssh-guard.sh ${remote[*]}" y || return 0
   ( do_deploy "${args[@]}" -- "${remote[@]}" )
@@ -1026,7 +1217,7 @@ ask_banlog_opts() {
 
 do_menu() {
   local choice ips root_tip=""
-  [ "$(id -u)" -eq 0 ] || root_tip="  （当前不是 root，只能使用 8 批量部署；其他功能请用 sudo 运行）"
+  [ "$(id -u)" -eq 0 ] || root_tip="  （当前不是 root，只能使用 9 批量部署；其他功能请用 sudo 运行）"
   while true; do
     cat <<EOF
 
@@ -1036,10 +1227,11 @@ do_menu() {
   3) 一键封禁日志中的爆破 IP 和 IP 段
   4) 查看封禁状态
   5) 解封 IP 或 IP 段
-  6) 关闭 SSH 密码登录（仅允许密钥）
-  7) 恢复 SSH 密码登录
-  8) 批量部署到多台服务器
-  9) 卸载 ssh-guard 的 fail2ban 配置和网段封禁
+  6) 启用 SSH 密钥登录（添加公钥）
+  7) 关闭 SSH 密码登录（仅允许密钥）
+  8) 恢复 SSH 密码登录
+  9) 批量部署到多台服务器
+ 10) 卸载 ssh-guard 的 fail2ban 配置和网段封禁
   0) 退出
 $root_tip
 EOF
@@ -1059,13 +1251,14 @@ EOF
       5) ask ips "要解封的 IP 或网段（如 1.2.3.4 5.6.7.0/24，空格分隔）" ""
          # shellcheck disable=SC2086
          [ -n "$ips" ] && ( do_unban $ips ) ;;
-      6) if confirm "确认已配置公钥，并已在另一个窗口测试过密钥登录" n; then
+      6) menu_addkey ;;
+      7) if confirm "确认已配置公钥，并已在另一个窗口测试过密钥登录" n; then
            if confirm "没检测到公钥时也强制关闭（可能把自己锁在外面）" n; then FORCE=1; else FORCE=0; fi
            ( do_harden )
          fi ;;
-      7) ( do_unharden ) ;;
-      8) menu_deploy ;;
-      9) confirm "确认移除 ssh-guard 的 fail2ban 配置和网段封禁" n && ( do_uninstall ) ;;
+      8) ( do_unharden ) ;;
+      9) menu_deploy ;;
+      10) confirm "确认移除 ssh-guard 的 fail2ban 配置和网段封禁" n && ( do_uninstall ) ;;
       0|q|Q|exit) exit 0 ;;
       *) warn "无效选择"; continue ;;
     esac
@@ -1099,6 +1292,11 @@ while [ $# -gt 0 ]; do
     --subnet-min) SUBNET_MIN=${2:?}; shift 2 ;;
     --no-subnet) NO_SUBNET=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --user) KEY_USER=${2:?}; shift 2 ;;
+    --key) KEY_TEXT+="${KEY_TEXT:+$'\n'}${2:?}"; shift 2 ;;
+    --key-file) KEY_FILE=${2:?}; shift 2 ;;
+    --github) KEY_GITHUB=${2:?}; shift 2 ;;
+    --generate) KEY_GEN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -v|--version) echo "ssh-guard $VERSION"; exit 0 ;;
     -*) die "未知选项: $1（ssh-guard.sh help 查看用法）" ;;
@@ -1110,6 +1308,7 @@ case "$CMD" in
   menu) tty_ok || die "没有可用的终端，无法进入交互菜单"; do_menu ;;
   install) do_install ;;
   report) do_report ;;
+  addkey) do_addkey ;;
   harden) do_harden ;;
   unharden) do_unharden ;;
   status) do_status ;;

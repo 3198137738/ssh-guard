@@ -10,11 +10,36 @@ SSH 爆破防护一键脚本，基于 fail2ban：
 - **关闭密码登录**（可选）：先检查是否配置了公钥，`sshd -t` 校验失败自动回滚
 - 兼容 Debian / Ubuntu / CentOS / Rocky / Alma / openSUSE / Alpine；iptables / nftables / firewalld；auth.log / secure / journal；OpenSSH 9.8+ 的 `sshd-session`
 
-## 单台服务器一键运行
+所有功能都在 `ssh-guard.sh` 这一个脚本里，可以用交互菜单选择，也可以用命令行参数直接执行。
+
+## 交互菜单（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash
+```
+
+```
+=================== ssh-guard ===================
+  1) 安装/更新防护（fail2ban aggressive 模式 + 自动封禁）
+  2) 爆破分析报告（Top IP、首/末次时间、/24 网段）
+  3) 查看封禁状态
+  4) 解封 IP
+  5) 关闭 SSH 密码登录（仅允许密钥）
+  6) 恢复 SSH 密码登录
+  7) 批量部署到多台服务器
+  8) 卸载 ssh-guard 的 fail2ban 配置
+  0) 退出
+```
+
+选择后会逐项询问参数（回车使用默认值），执行完返回菜单。
+
+## 命令行（适合脚本、cron、批量）
+
+没有终端时（如 cron、批量部署）不带参数默认执行 `install`。
 
 ```bash
 # 安装防护（可重复执行，用于更新配置）
-curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- install
 
 # 查看爆破分析报告
 curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- report
@@ -34,13 +59,15 @@ sudo ./ssh-guard.sh help
 
 | 命令 | 说明 |
 | --- | --- |
-| `install`（默认） | 安装/更新 fail2ban 防护 |
+| `menu` | 交互菜单（有终端时不带参数的默认行为） |
+| `install` | 安装/更新 fail2ban 防护（无终端时的默认行为） |
 | `report` | 爆破分析报告 |
 | `harden` | 关闭密码登录，只允许密钥 |
 | `unharden` | 撤销 harden |
 | `status` | 查看封禁情况 |
 | `unban <IP>...` | 解封 IP |
 | `uninstall` | 移除 ssh-guard 写入的 fail2ban 配置 |
+| `deploy` | 批量在多台服务器上执行上面的命令 |
 
 `install` 选项：
 
@@ -59,20 +86,35 @@ sudo ./ssh-guard.sh help
 
 ## 多台服务器批量执行
 
-在本机（Linux / macOS / WSL / Git Bash）执行，脚本内容通过 SSH 传过去，服务器不需要能访问 GitHub：
+在任意一台能 SSH 到其他服务器的机器（Linux / macOS / WSL / Git Bash）上执行，脚本内容通过 SSH 传过去，目标服务器不需要能访问 GitHub。本机执行 deploy 不需要 root。
+
+交互方式：菜单里选 `7`，按提示输入服务器列表文件（或直接逐行输入服务器）、要执行的操作和参数即可。
+
+命令行方式：
 
 ```bash
-git clone https://github.com/3198137738/ssh-guard.git && cd ssh-guard
-cp hosts.example.txt hosts.txt   # 每行一台: [user@]host[:port]
-vi hosts.txt
+# 服务器列表，每行一台: [user@]host[:port]，# 开头为注释
+cat > hosts.txt <<'EOF'
+192.168.1.10
+ubuntu@10.0.0.5:2222
+EOF
 
-./deploy.sh -f hosts.txt                              # 全部安装防护
-./deploy.sh -f hosts.txt -s -- report --top 10        # 全部出报告并打印
-./deploy.sh -f hosts.txt -- install --disable-password
-./deploy.sh -f hosts.txt -P 20 -i ~/.ssh/id_ed25519 -- status
+S=https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh
+curl -fsSL $S | bash -s -- deploy -f hosts.txt                          # 全部安装防护
+curl -fsSL $S | bash -s -- deploy -f hosts.txt -s -- report --top 10    # 全部出报告并打印
+curl -fsSL $S | bash -s -- deploy -f hosts.txt -- install --disable-password
+curl -fsSL $S | bash -s -- deploy -f hosts.txt -P 20 -i ~/.ssh/id_ed25519 -- status
 ```
 
-每台服务器的输出保存在 `logs/<时间>/<host>.log`。要求本机能用密钥免密登录这些服务器；非 root 用户需要免密 sudo。
+| deploy 选项 | 说明 |
+| --- | --- |
+| `-f, --hosts FILE` | 服务器列表 |
+| `-P, --parallel N` | 并发数（默认 10） |
+| `-i, --identity KEY` | SSH 私钥 |
+| `-u, --user USER` | 未写用户名时的默认用户（默认 root） |
+| `-s, --show` | 结束后打印每台服务器的输出 |
+
+`--` 后面是要在远程执行的命令和参数，默认 `install`。每台服务器的输出保存在 `ssh-guard-logs/<时间>/<host>.log`。要求本机能用密钥免密登录这些服务器；非 root 用户需要免密 sudo。执行 deploy 的这台机器的 IP 会自动加入各服务器的白名单。
 
 ## 写入的文件
 
@@ -88,4 +130,4 @@ vi hosts.txt
 
 - 关闭密码登录后**不要断开当前会话**，另开窗口用密钥登录成功再退出
 - 误封自己：从控制台登录后执行 `ssh-guard.sh unban <IP>`，并用 `install --ignoreip <IP>` 加入白名单
-- 国内服务器访问 `raw.githubusercontent.com` 不稳定时，用 `deploy.sh` 从本机推送
+- 国内服务器访问 `raw.githubusercontent.com` 不稳定时，在能访问 GitHub 的机器上用 `deploy` 推送

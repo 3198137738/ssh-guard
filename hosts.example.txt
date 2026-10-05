@@ -1,5 +1,5 @@
 # 每行一台服务器: [user@]host[:port]
-# 没写用户名时默认 root（可用 deploy.sh -u 修改）
+# 没写用户名时默认 root（可用 ssh-guard.sh deploy -u 修改）
 192.168.1.10
 root@192.168.1.11
 ubuntu@10.0.0.5:2222

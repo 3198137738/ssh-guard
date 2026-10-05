@@ -4,13 +4,16 @@
 #   - 检测到 Docker 时额外在 DOCKER-USER 链封禁（容器映射端口不走 INPUT 链）
 #   - 爆破分析报告：失败次数 Top IP、首/末次时间、是否已封、/24 网段汇总
 #   - 可选关闭 SSH 密码登录（带密钥检查与自动回滚）
+#   - 批量并发部署到多台服务器（脚本经 SSH 传过去，服务器无需访问 GitHub）
 #
-# 一键运行：
+# 一键运行（不带参数进入交互菜单）：
 #   curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash
-#   curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- report
+# 非交互：
+#   curl -fsSL https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh | sudo bash -s -- install
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+RAW_URL="https://raw.githubusercontent.com/3198137738/ssh-guard/main/ssh-guard.sh"
 JAIL_FILE=/etc/fail2ban/jail.d/ssh-guard.local
 F2B_CONF_FILE=/etc/fail2ban/fail2ban.d/ssh-guard.local
 FILTER_NAME=ssh-guard-sshd
@@ -41,15 +44,18 @@ die()  { printf '%s[✗]%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 用法: ssh-guard.sh [命令] [选项]
+不带任何参数且有终端时进入交互菜单；没有终端时（如 cron、批量部署）默认执行 install。
 
 命令:
-  install              安装/更新 fail2ban 防护（默认命令，可重复执行）
+  menu                 交互菜单
+  install              安装/更新 fail2ban 防护（可重复执行）
   report               分析 SSH 爆破日志：Top IP、首/末次时间、是否已封、/24 网段汇总
   harden               关闭 SSH 密码登录，只允许密钥（会先检查是否已配置公钥）
   unharden             撤销 harden，恢复原来的密码登录设置
   status               查看当前封禁情况
   unban <IP>...        解封 IP
   uninstall            移除 ssh-guard 写入的 fail2ban 配置（不卸载 fail2ban）
+  deploy               在多台服务器上并发执行本脚本的某个命令（本机无需 root）
   help                 显示本帮助
 
 install 选项:
@@ -68,10 +74,19 @@ report 选项:
   --top N              显示前 N 个 IP（默认 30）
   --log FILE           指定日志文件（支持 .gz）
 
+deploy 用法: ssh-guard.sh deploy -f hosts.txt [选项] [-- 远程命令和参数]（远程命令默认 install）
+  -f, --hosts FILE     服务器列表，每行 [user@]host[:port]，# 开头为注释
+  -P, --parallel N     并发数（默认 10）
+  -i, --identity KEY   SSH 私钥
+  -u, --user USER      未写用户名时的默认用户（默认 root）
+  -s, --show           结束后打印每台服务器的输出
+  要求本机能用密钥免密登录；非 root 用户需要免密 sudo。输出保存在 ./ssh-guard-logs/
+
 示例:
   curl -fsSL <RAW_URL> | sudo bash
   curl -fsSL <RAW_URL> | sudo bash -s -- install --maxretry 5 --ignoreip "1.2.3.4" --disable-password
   curl -fsSL <RAW_URL> | sudo bash -s -- report --since "24 hours ago"
+  curl -fsSL <RAW_URL> | bash -s -- deploy -f hosts.txt -s -- report --top 10
 EOF
 }
 
@@ -558,10 +573,205 @@ do_uninstall() {
   return 0
 }
 
+# -------------------------------------------------------------- deploy ---
+
+# 本脚本自身的路径；通过 curl | bash 运行时没有文件，从 GitHub 重新下载一份
+self_script() {
+  local src=${BASH_SOURCE[0]:-}
+  if [ -n "$src" ] && [ -f "$src" ] && grep -q 'ssh-guard' "$src" 2>/dev/null; then echo "$src"; return 0; fi
+  local tmp; tmp=$(mktemp)
+  if curl -fsSL "$RAW_URL" -o "$tmp" 2>/dev/null || wget -qO "$tmp" "$RAW_URL" 2>/dev/null; then echo "$tmp"; return 0; fi
+  rm -f "$tmp"
+  return 1
+}
+
+deploy_one() {
+  local spec=$1 user host port name rc
+  spec=${spec%%#*}
+  spec=$(printf '%s' "$spec" | tr -d '[:space:]')
+  [ -n "$spec" ] || return 0
+  case "$spec" in *@*) user=${spec%%@*}; host=${spec#*@} ;; *) user=$DEPLOY_USER; host=$spec ;; esac
+  case "$host" in *:*) port=${host##*:}; host=${host%:*} ;; *) port=22 ;; esac
+  name=$host
+  [ "$port" != 22 ] && name="$host-$port"
+
+  local opts=(-p "$port" -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
+  [ -n "$DEPLOY_IDENTITY" ] && opts+=(-i "$DEPLOY_IDENTITY")
+  ssh "${opts[@]}" "$user@$host" "$DEPLOY_CMD" <"$DEPLOY_SCRIPT" >"$DEPLOY_LOG_DIR/$name.log" 2>&1
+  rc=$?
+  echo "$rc" >"$DEPLOY_LOG_DIR/$name.rc"
+  if [ "$rc" -eq 0 ]; then echo "[成功] $user@$host:$port"; else echo "[失败] $user@$host:$port (退出码 $rc) → $DEPLOY_LOG_DIR/$name.log"; fi
+}
+
+do_deploy() {
+  local hosts_file="" parallel=10 show=0
+  DEPLOY_IDENTITY="" DEPLOY_USER=root
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--hosts) hosts_file=${2:?}; shift 2 ;;
+      -P|--parallel) parallel=${2:?}; shift 2 ;;
+      -i|--identity) DEPLOY_IDENTITY=${2:?}; shift 2 ;;
+      -u|--user) DEPLOY_USER=${2:?}; shift 2 ;;
+      -s|--show) show=1; shift ;;
+      --) shift; break ;;
+      *) die "deploy 未知选项: $1（ssh-guard.sh help 查看用法）" ;;
+    esac
+  done
+  [ -n "$hosts_file" ] && [ -f "$hosts_file" ] || die "服务器列表不存在: ${hosts_file:-（未指定 -f）}"
+  [ $# -gt 0 ] || set -- install
+  case "$1" in deploy|menu) die "远程命令不能是 $1" ;; esac
+  command -v ssh >/dev/null 2>&1 || die "本机没有 ssh 命令"
+
+  DEPLOY_SCRIPT=$(self_script) || die "获取脚本失败，请先下载 ssh-guard.sh 到本地再执行: $RAW_URL"
+  DEPLOY_LOG_DIR="ssh-guard-logs/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$DEPLOY_LOG_DIR"
+  # sudo 会清掉 SSH_CLIENT，显式传进去，让远程把本机 IP 加入白名单
+  local args; args=$(printf '%q ' "$@")
+  DEPLOY_CMD="if [ \"\$(id -u)\" -eq 0 ]; then bash -s -- $args; else sudo -n env SSH_CLIENT=\"\$SSH_CLIENT\" bash -s -- $args; fi"
+  export DEPLOY_SCRIPT DEPLOY_LOG_DIR DEPLOY_CMD DEPLOY_IDENTITY DEPLOY_USER
+  export -f deploy_one
+
+  info "执行: ssh-guard.sh $*    并发: $parallel    日志: $DEPLOY_LOG_DIR/"
+  grep -vE '^[[:space:]]*(#|$)' "$hosts_file" | xargs -P "$parallel" -I{} bash -c 'deploy_one "$1"' _ {}
+
+  local total failed f
+  total=$(ls "$DEPLOY_LOG_DIR"/*.rc 2>/dev/null | wc -l)
+  failed=$(grep -lv '^0$' "$DEPLOY_LOG_DIR"/*.rc 2>/dev/null | wc -l)
+  echo
+  info "完成: 共 $total 台，成功 $((total - failed)) 台，失败 $failed 台"
+  if [ "$show" = 1 ]; then
+    for f in "$DEPLOY_LOG_DIR"/*.log; do
+      [ -f "$f" ] || continue
+      printf '\n################ %s ################\n' "$(basename "$f" .log)"
+      cat "$f"
+    done
+  fi
+  [ "$failed" -eq 0 ]
+}
+
+# ---------------------------------------------------------------- menu ---
+
+tty_ok() { { : </dev/tty; } 2>/dev/null; }
+
+# ask 变量名 提示 [默认值]：从终端读取（curl | bash 时 stdin 是脚本本身，必须读 /dev/tty）
+ask() {
+  local __v=""
+  read -r -p "$2${3:+ [$3]}: " __v </dev/tty || true
+  printf -v "$1" '%s' "${__v:-${3:-}}"
+}
+
+confirm() { # confirm 提示 默认(y/n)
+  local __a
+  ask __a "$1 (y/n)" "$2"
+  case "$__a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+ask_int() { # ask_int 变量名 提示 默认值
+  while true; do
+    ask "$1" "$2" "$3"
+    case "${!1}" in ''|*[!0-9]*) warn "请输入正整数" ;; *) return 0 ;; esac
+  done
+}
+
+# 交互式收集 install 参数，结果放在 INSTALL_ARGS
+ask_install_opts() {
+  ask_int MAXRETRY "失败几次封禁" "$MAXRETRY"
+  ask FINDTIME "统计窗口（如 10m / 1h / 1d）" "$FINDTIME"
+  ask BANTIME "封禁时长（-1 为永久，或如 1d / 7d）" "$BANTIME"
+  ask IGNOREIP "额外白名单 IP（空格分隔，可留空；当前登录 IP 会自动加入）" ""
+  if confirm "检测到 Docker 时也在 DOCKER-USER 链封禁" y; then DOCKER=auto; else DOCKER=no; fi
+  if confirm "同时关闭 SSH 密码登录（需已配置并测试过密钥）" n; then DISABLE_PW=1; else DISABLE_PW=0; fi
+  INSTALL_ARGS=(install --maxretry "$MAXRETRY" --findtime "$FINDTIME" --bantime "$BANTIME")
+  [ -n "$IGNOREIP" ] && INSTALL_ARGS+=(--ignoreip "$IGNOREIP")
+  [ "$DOCKER" = no ] && INSTALL_ARGS+=(--no-docker)
+  [ "$DISABLE_PW" = 1 ] && INSTALL_ARGS+=(--disable-password)
+  return 0
+}
+
+menu_deploy() {
+  local hosts_file line opt parallel user identity remote=() args=()
+  ask hosts_file "服务器列表文件（每行 [user@]host[:port]，留空则现在逐行输入）" ""
+  if [ -z "$hosts_file" ]; then
+    hosts_file=$(mktemp)
+    echo "逐行输入服务器，输入空行结束："
+    while read -r -p "> " line </dev/tty && [ -n "$line" ]; do echo "$line" >>"$hosts_file"; done
+  fi
+  [ -s "$hosts_file" ] || { warn "服务器列表为空"; return 1; }
+  echo "  共 $(grep -cvE '^[[:space:]]*(#|$)' "$hosts_file") 台服务器"
+
+  echo "在这些服务器上执行："
+  echo "  1) 安装/更新防护    2) 爆破分析报告    3) 查看封禁状态    4) 关闭密码登录"
+  ask opt "请选择" 1
+  case "$opt" in
+    1) ask_install_opts; remote=("${INSTALL_ARGS[@]}") ;;
+    2) ask_int TOP "每台显示前几个 IP" 10; remote=(report --top "$TOP") ;;
+    3) remote=(status) ;;
+    4) confirm "确认所有服务器都已配置公钥并测试过密钥登录" n || return 0; remote=(harden) ;;
+    *) warn "无效选择"; return 1 ;;
+  esac
+  ask_int parallel "并发数" 10
+  ask user "未写用户名时的默认用户" root
+  ask identity "SSH 私钥路径（留空使用默认密钥）" ""
+
+  args=(-f "$hosts_file" -P "$parallel" -u "$user")
+  [ -n "$identity" ] && args+=(-i "$identity")
+  case "${remote[0]}" in report|status) args+=(-s) ;; esac
+  confirm "开始执行 ssh-guard.sh ${remote[*]}" y || return 0
+  ( do_deploy "${args[@]}" -- "${remote[@]}" )
+}
+
+do_menu() {
+  local choice ips root_tip=""
+  [ "$(id -u)" -eq 0 ] || root_tip="  （当前不是 root，只能使用 7 批量部署；其他功能请用 sudo 运行）"
+  while true; do
+    cat <<EOF
+
+=================== ssh-guard $VERSION ===================
+  1) 安装/更新防护（fail2ban aggressive 模式 + 自动封禁）
+  2) 爆破分析报告（Top IP、首/末次时间、/24 网段）
+  3) 查看封禁状态
+  4) 解封 IP
+  5) 关闭 SSH 密码登录（仅允许密钥）
+  6) 恢复 SSH 密码登录
+  7) 批量部署到多台服务器
+  8) 卸载 ssh-guard 的 fail2ban 配置
+  0) 退出
+$root_tip
+EOF
+    ask choice "请选择" ""
+    # 每个功能在子 shell 中执行，出错 die 时只退出该功能，回到菜单
+    case "$choice" in
+      1) ask_install_opts; ( do_install ) ;;
+      2) ask_int TOP "显示前几个 IP" "$TOP"
+         ask SINCE "只看某时间之后的日志（如 24 hours ago，留空为全部）" ""
+         ( do_report ) ;;
+      3) ( do_status ) ;;
+      4) ask ips "要解封的 IP（空格分隔）" ""
+         # shellcheck disable=SC2086
+         [ -n "$ips" ] && ( do_unban $ips ) ;;
+      5) if confirm "确认已配置公钥，并已在另一个窗口测试过密钥登录" n; then
+           if confirm "没检测到公钥时也强制关闭（可能把自己锁在外面）" n; then FORCE=1; else FORCE=0; fi
+           ( do_harden )
+         fi ;;
+      6) ( do_unharden ) ;;
+      7) menu_deploy ;;
+      8) confirm "确认移除 ssh-guard 的 fail2ban 配置" n && ( do_uninstall ) ;;
+      0|q|Q|exit) exit 0 ;;
+      *) warn "无效选择"; continue ;;
+    esac
+    ask choice "按回车返回菜单" ""
+  done
+}
+
 # ---------------------------------------------------------------- main ---
 
-CMD=install
+CMD=""
 if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then CMD=$1; shift; fi
+if [ "$CMD" = deploy ]; then do_deploy "$@"; exit; fi
+# 不带任何参数且有终端 → 菜单；否则保持原来的默认行为 install
+if [ -z "$CMD" ]; then
+  if [ $# -eq 0 ] && tty_ok; then CMD=menu; else CMD=install; fi
+fi
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -583,6 +793,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$CMD" in
+  menu) tty_ok || die "没有可用的终端，无法进入交互菜单"; do_menu ;;
   install) do_install ;;
   report) do_report ;;
   harden) do_harden ;;
